@@ -25,47 +25,55 @@ def get_task_for_name(client, name):
 
 
 async def main():
-    argparser = argparse.ArgumentParser()
-    argparser.add_argument('file', action='store', help='The Typst file to compile')
-    argparser.add_argument('--typst-command', default='typst', action='store', help='The Typst executable to use')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('file', action='store', help='The Typst file to compile')
+    parser.add_argument('--typst-command', default='typst', action='store', help='The Typst executable to use')
 
-    args = argparser.parse_args()
+    args = parser.parse_args()
     file_path = Path(args.file)
 
-    output = subprocess.check_output([args.typst_command, 'query', file_path, '<typst-notebook>'])
+    output = subprocess.check_output([args.typst_command, 'query', file_path, 'selector(<typst-notebook>).or(<typst-notebook-cell>)'])
     labels = json.loads(output)
     print(labels)
     output_directory = file_path.parent / '.typst-notebook'
     output_directory.mkdir(exist_ok=True)
 
     manager = jupyter_client.AsyncMultiKernelManager()
+    notebooks = {}
 
-    for i, label in enumerate(labels, start=1):
-        lang = label['lang']
-        if lang not in manager.list_kernel_ids():
-            await manager.start_kernel(kernel_name=lang, kernel_id=lang)
+    for label in labels:
+        match label:
+            case {'label': "<typst-notebook>", 'value': notebook}:
+                if notebook['id'] in manager.list_kernel_ids():
+                    raise Exception(f"Notebook with id {notebook['id']} already exists")
+                await manager.start_kernel(kernel_name=notebook['kernel'], kernel_id=notebook['id'])
+                notebooks[label['value']['id']] = []
+            case {'label': "<typst-notebook-cell>", 'value': cell}:
+                client = manager.get_kernel(cell['notebook']).client()
+                cell_info = {
+                    'code': cell['code'],
+                    'display-data': []
+                }
+                notebooks[cell['notebook']].append(cell_info)
 
-        client = manager.get_kernel(lang).client()
+                print("Running", cell['code'])
+                client.execute(cell['code'])
+                status = 'busy'
+                while status != 'idle':
+                    msg = await client.get_iopub_msg()
+                    match msg['msg_type']:
+                        case 'status':
+                            status = msg['content']['execution_state']
+                        case 'display_data' | 'execute_result':
+                            cell_info['display-data'].append(msg['content']['data'])
+                        case 'execute_input':
+                            pass
+                        case x:
+                            print(f"Unhandled {x}")
 
-        print("Running", label['text'])
-        client.execute(label['text'])
-        output = []
-        status = 'busy'
-        while status != 'idle':
-            msg = await client.get_iopub_msg()
-            print(msg)
-            match msg['msg_type']:
-                case 'status':
-                    status = msg['content']['execution_state']
-                case 'display_data':
-                    output.append(msg['content']['data'])
-                case 'execute_input':
-                    pass
-                case x:
-                    print(f"Unhandled {x}")
-
-        with open(output_directory / f'output-{i}.json', 'w+') as f:
-            json.dump(output, f)
+    await manager.shutdown_all()
+    with open(output_directory / "output.json", 'w+') as f:
+        json.dump(notebooks, f)
 
     subprocess.run([args.typst_command, 'compile', file_path])
 
